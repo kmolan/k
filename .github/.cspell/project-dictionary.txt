@@ -6,6 +6,7 @@ funcs
 kajita
 levenberg
 libglu
+liegeois
 manipulability
 marquardt
 nullspace

@@ -152,6 +152,9 @@ where
 const DEFAULT_MANIPULABILITY_THRESHOLD: f64 = 1e-3;
 /// Default maximum squared damping factor `lambda^2_max`, approached as `w -> 0`.
 const DEFAULT_MAX_DAMPING_SQUARED: f64 = 1e-3;
+/// Default joint-limit-avoidance gain `k0`. Zero disables the opt-in null-space avoidance, so the
+/// solver is numerically identical to plain damped least squares unless a caller raises it.
+const DEFAULT_JOINT_LIMIT_AVOIDANCE_GAIN: f64 = 0.0;
 
 /// Inverse Kinematics Solver using the Jacobian matrix with Damped Least Squares (DLS).
 ///
@@ -180,6 +183,10 @@ pub struct JacobianIkSolver<T: RealField> {
     pub manipulability_threshold: T,
     /// Maximum squared damping factor `lambda^2_max`, approached as the manipulability `w -> 0`.
     pub max_damping_squared: T,
+    /// Joint-limit-avoidance gain `k0` for the opt-in null-space secondary task (Liegeois 1977).
+    /// Defaults to 0 (avoidance off). Only acts on redundant systems (`n > m`); see
+    /// `set_joint_limit_avoidance_gain`.
+    pub joint_limit_avoidance_gain: T,
     /// Nullspace function for a redundant system
     #[allow(clippy::type_complexity)]
     nullspace_function: Option<Box<dyn Fn(&[T]) -> Vec<T> + Send + Sync>>,
@@ -204,6 +211,44 @@ fn damping_squared<T: RealField>(w: T, w0: T, lambda_squared_max: T) -> T {
     // 0 <= w < w0  =>  1 - w/w0 in (0, 1];  lambda^2 = lambda_squared_max * (1 - w/w0)^2.
     let factor = T::one() - w / w0;
     lambda_squared_max * factor.clone() * factor
+}
+
+/// Liegeois (1977) joint-limit-avoidance gradient, used as the secondary null-space task: each
+/// component pushes a joint toward the center of its range, weighted so a joint near a bound moves
+/// more strongly.
+///
+/// `subtask_i = gain * (mid_i - theta_i) / (max_i - min_i)^2`, with `mid_i = (min_i + max_i) / 2`.
+/// The sign descends the cost `H = sum_i ((theta_i - mid_i) / (max_i - min_i))^2`, i.e. it moves
+/// toward `mid` (avoidance). A joint with no limit (`None`) or a degenerate range (`max <= min`, e.g.
+/// a locked joint) contributes `0` — this is the divide-by-zero guard. The result drops the
+/// `ignored_joint_indices` components so it lines up with the reduced `n`-column Jacobian.
+fn joint_limit_avoidance_gradient<T: RealField>(
+    gain: T,
+    positions: &[T],
+    limits: &[Option<(T, T)>],
+    ignored_joint_indices: &[usize],
+) -> DVector<T> {
+    let mut subtask: Vec<T> = positions
+        .iter()
+        .zip(limits)
+        .map(|(theta, limit)| match limit {
+            Some((min, max)) => {
+                let range = max.clone() - min.clone();
+                if range <= T::zero() {
+                    T::zero()
+                } else {
+                    let mid = (min.clone() + max.clone()) / (T::one() + T::one());
+                    gain.clone() * (mid - theta.clone()) / (range.clone() * range)
+                }
+            }
+            None => T::zero(),
+        })
+        .collect();
+    // Indices are sorted ascending; removing in order keeps the remaining components aligned.
+    for (i, joint_index) in ignored_joint_indices.iter().enumerate() {
+        subtask.remove(*joint_index - i);
+    }
+    DVector::from_vec(subtask)
 }
 
 impl<T> JacobianIkSolver<T>
@@ -233,6 +278,7 @@ where
             num_max_try,
             manipulability_threshold: na::convert(DEFAULT_MANIPULABILITY_THRESHOLD),
             max_damping_squared: na::convert(DEFAULT_MAX_DAMPING_SQUARED),
+            joint_limit_avoidance_gain: na::convert(DEFAULT_JOINT_LIMIT_AVOIDANCE_GAIN),
             nullspace_function: None,
         }
     }
@@ -289,6 +335,22 @@ where
     /// ```
     pub fn set_max_damping(&mut self, max_damping_squared: T) {
         self.max_damping_squared = max_damping_squared;
+    }
+
+    /// Set the joint-limit-avoidance gain `k0`, enabling the opt-in null-space secondary task that
+    /// pushes redundant joints toward the center of their range (Liegeois 1977). `0` (the default)
+    /// disables it, leaving the solve numerically identical to plain damped least squares. The
+    /// avoidance only acts on redundant systems (`n > m`) and perturbs the primary task to first
+    /// order, so keep `k0` small; a joint may need a larger `num_max_try` to be pulled off a bound.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut solver = k::JacobianIkSolver::new(0.01, 0.01, 0.5, 100);
+    /// solver.set_joint_limit_avoidance_gain(0.1);
+    /// ```
+    pub fn set_joint_limit_avoidance_gain(&mut self, joint_limit_avoidance_gain: T) {
+        self.joint_limit_avoidance_gain = joint_limit_avoidance_gain;
     }
 
     fn add_positions_with_multiplier(&self, input: &[T], add_values: &[T]) -> Vec<T> {
@@ -358,15 +420,43 @@ where
         // Primary task step  d_q = J^T (J J^T + lambda^2 I)^-1 e.
         let mut d_q = &j_t * cholesky.solve(&err);
 
-        // Optional secondary task projected into the null space of the primary task, without
-        // forming the n x n projector:  d_q += (I - J^T A^-1 J) g, with g the user nullspace
-        // gradient reduced over the ignored joints. Only meaningful when redundant (n > m).
+        // Optional secondary task projected into the null space of the primary task, without forming
+        // the n x n projector:  d_q += (I - J^T A^-1 J) g. Only meaningful when redundant (n > m).
+        // g sums the opt-in joint-limit-avoidance gradient (when the gain is non-zero) and the user
+        // nullspace gradient, both reduced over the ignored joints. With gain 0 and no nullspace
+        // function nothing is added, so the step is identical to plain damped least squares.
         if available_dof > required_dof {
+            let mut g: Option<DVector<T>> = None;
+            if self.joint_limit_avoidance_gain != T::zero() {
+                // Read the limits into owned data; the JointRefGuards are dropped here, before any
+                // matrix math or set_* call (holding a guard across set_joint_positions_* deadlocks).
+                let limits: Vec<Option<(T, T)>> = arm
+                    .iter_joints()
+                    .map(|joint| {
+                        joint
+                            .limits
+                            .as_ref()
+                            .map(|range| (range.min.clone(), range.max.clone()))
+                    })
+                    .collect();
+                g = Some(joint_limit_avoidance_gradient(
+                    self.joint_limit_avoidance_gain.clone(),
+                    &orig_positions,
+                    &limits,
+                    ignored_joint_indices,
+                ));
+            }
             if let Some(ref f) = self.nullspace_function {
-                let mut g = DVector::from_vec(f(&orig_positions));
+                let mut user = DVector::from_vec(f(&orig_positions));
                 for (i, joint_index) in ignored_joint_indices.iter().enumerate() {
-                    g = g.remove_row(*joint_index - i);
+                    user = user.remove_row(*joint_index - i);
                 }
+                g = Some(match g {
+                    Some(limit) => limit + user,
+                    None => user,
+                });
+            }
+            if let Some(g) = g {
                 let z = cholesky.solve(&(&jacobi * &g));
                 d_q += g - &j_t * z;
             }
@@ -460,6 +550,10 @@ impl<T: RealField + fmt::Debug> fmt::Debug for JacobianIkSolver<T> {
             .field("num_max_try", &self.num_max_try)
             .field("manipulability_threshold", &self.manipulability_threshold)
             .field("max_damping_squared", &self.max_damping_squared)
+            .field(
+                "joint_limit_avoidance_gain",
+                &self.joint_limit_avoidance_gain,
+            )
             .field("has_nullspace_function", &self.nullspace_function.is_some())
             .finish()
     }
@@ -644,5 +738,34 @@ mod tests {
         // A non-positive threshold disables damping for any w.
         assert_eq!(damping_squared(0.5, 0.0, max), 0.0);
         assert_eq!(damping_squared(0.5, -1.0, max), 0.0);
+    }
+
+    #[test]
+    fn test_joint_limit_avoidance_gradient() {
+        let gain = 1.0_f64;
+        // Joints: symmetric [-1,1] (mid 0); locked [2,2]; unlimited; [0,2] (mid 1).
+        let limits = vec![Some((-1.0, 1.0)), Some((2.0, 2.0)), None, Some((0.0, 2.0))];
+        let positions = vec![0.0, 2.0, 5.0, 1.9];
+        let g = joint_limit_avoidance_gradient(gain, &positions, &limits, &[]);
+        assert_eq!(g.len(), 4);
+        // At mid -> 0.
+        assert!((g[0] - 0.0).abs() < 1e-12);
+        // Locked (max == min) -> 0 and finite (divide-by-zero guard).
+        assert_eq!(g[1], 0.0);
+        assert!(g[1].is_finite());
+        // No limit -> 0.
+        assert_eq!(g[2], 0.0);
+        // Near max -> negative: (1 - 1.9) / 2^2 = -0.225.
+        assert!(g[3] < 0.0);
+        assert!((g[3] - (-0.225)).abs() < 1e-12);
+        // Near min -> positive.
+        let near_min = joint_limit_avoidance_gradient(gain, &[0.1], &[Some((0.0, 2.0))], &[]);
+        assert!(near_min[0] > 0.0);
+        // Reduction drops the ignored joint (index 1), keeping the rest aligned.
+        let reduced = joint_limit_avoidance_gradient(gain, &positions, &limits, &[1]);
+        assert_eq!(reduced.len(), 3);
+        assert_eq!(reduced[0], g[0]);
+        assert_eq!(reduced[1], g[2]);
+        assert_eq!(reduced[2], g[3]);
     }
 }
