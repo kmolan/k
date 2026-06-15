@@ -1,9 +1,15 @@
+cholesky
 deque
+dls
 doctest
 funcs
 kajita
+levenberg
 libglu
+manipulability
+marquardt
 nullspace
+pseudoinverse
 rctree
 rgba
 rng
@@ -15,3 +21,4 @@ seedable
 wellconditioned
 xacro
 xorg
+yoshikawa
