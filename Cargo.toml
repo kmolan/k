@@ -4,7 +4,7 @@ name = "k"
 # - Create "v0.x.y" git tag
 # - Push the above tag (run `git push origin --tags`)
 # Then, CI will publish to crates.io and create a GitHub release.
-version = "0.32.0"
+version = "0.33.0"
 authors = ["Takashi Ogura <t.ogura@gmail.com>"]
 edition = "2021"
 description = "k is for kinematics"
