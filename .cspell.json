@@ -43,6 +43,8 @@
     "**/LICENSE*",
     // Binaries
     "**/*.drawio",
-    "**/*.png"
+    "**/*.png",
+    // Generated IK benchmark baseline, committed with the PR and removed before merge
+    "before.md"
   ]
 }

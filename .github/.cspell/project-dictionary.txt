@@ -6,8 +6,12 @@ libglu
 nullspace
 rctree
 rgba
+rng
+rngs
 rustdocflags
 rustflags
 ryzen
+seedable
+wellconditioned
 xacro
 xorg
